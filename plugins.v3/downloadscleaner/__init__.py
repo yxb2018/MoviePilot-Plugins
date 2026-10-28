@@ -69,7 +69,7 @@ class DownloadsCleaner(_PluginBase):
                    "支持目录白名单、排除目录、保护标签（含未入库待确认标签自动打标与解除）、"
                    "完成保护、分享率门槛、通知渠道、两阶段删除与详情统计。")
     plugin_icon = "clean.png"
-    plugin_version = "2.3.2"
+    plugin_version = "2.3.3"
     plugin_author = "yxb2018"
     plugin_config_prefix = "downloadscleaner_"
     plugin_order = 29
@@ -580,7 +580,7 @@ class DownloadsCleaner(_PluginBase):
                 has_tag = self._unconfirmed_tag in tags or self._LEGACY_UNCONFIRMED_TAG in tags
                 if has_tag:
                     # ① 已带标签：入库成功（有成功整理记录）→摘除标签回归删除列队；否则继续保护
-                    if self._transfer_state(transfer_oper, torrent_hash) == "success":
+                    if self._transfer_state(transfer_oper, torrent_hash, torrent) == "success":
                         for _t in (self._unconfirmed_tag, self._LEGACY_UNCONFIRMED_TAG):
                             if _t in tags:
                                 try:
@@ -614,7 +614,7 @@ class DownloadsCleaner(_PluginBase):
                     continue
                 # 仅「已整理」且 MP 有整理记录但结果为失败（failed）才打标；
                 # 已入库成功（success）无需保护；已整理但无任何记录（none）按约定不理会
-                state = self._transfer_state(transfer_oper, torrent_hash)
+                state = self._transfer_state(transfer_oper, torrent_hash, torrent)
                 if state != "failed":
                     continue
                 try:
@@ -680,7 +680,7 @@ class DownloadsCleaner(_PluginBase):
                 return None
             in_library = False
             if self._require_library:
-                in_library = self._transfer_state(transfer_oper, torrent_hash) == "success"
+                in_library = self._transfer_state(transfer_oper, torrent_hash, torrent) == "success"
                 if not in_library:
                     return None
             return {
@@ -699,25 +699,66 @@ class DownloadsCleaner(_PluginBase):
 
     # ---------------------------------------------------------------- 入库核验
 
-    def _transfer_state(self, transfer_oper: TransferHistoryOper, torrent_hash: str) -> str:
+    def _transfer_state(
+        self,
+        transfer_oper: TransferHistoryOper,
+        torrent_hash: str,
+        torrent: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """查询该 hash 的 MP 整理记录状态（核心判定，3 态）：
         - "success": 存在成功且目标在媒体库内的记录（已入库，可删）
         - "failed":  存在整理记录但均非成功入库（MP 已整理但结果是失败）
         - "none":    无任何整理记录
         约定：「已整理」标签 + 有失败记录 = 未入库待确认（需人工核查，插件自动保护）；
-        「已整理」标签 + 无任何记录 = 无需理会（MP 已加标签但无记录，非本插件职责）。"""
+        「已整理」标签 + 无任何记录 = 无需理会（MP 已加标签但无记录，非本插件职责）。
+
+        路径兜底：手动重识别（重新整理）的转移记录 download_hash 可能被写成 None，
+        导致 list_by_hash 落空而误判为未入库。此时改用 qB 种子 save_path+name 推导的
+        内容根目录，按 TransferHistoryOper.list_success_by_src(src, recursive=True)
+        做路径兜底查询（合规：仅经 Oper 访问宿主数据，不 import 宿主 Model）。"""
         try:
             records = transfer_oper.list_by_hash(torrent_hash) or []
         except Exception as err:
             logger.warning(f"{self.LOG_TAG}查询整理记录失败 {torrent_hash[:12]}：{err}")
-            return "none"
+            records = []
+        state = self._judge_records(records)
+        if state is not None:
+            return state
+        # 兜底：按源路径递归查成功记录（兼容 download_hash 为 None 的手动重传记录）
+        if torrent:
+            try:
+                src_root = self._content_root(torrent)
+                if src_root:
+                    fallback = transfer_oper.list_success_by_src(src_root, recursive=True) or []
+                    state = self._judge_records(fallback)
+                    if state is not None:
+                        return state
+            except Exception as err:
+                logger.warning(
+                    f"{self.LOG_TAG}源路径兜底查询失败 {str(torrent.get('name', ''))[:40]}：{err}"
+                )
+        return "none"
+
+    @staticmethod
+    def _judge_records(records: Any) -> Optional[str]:
+        """统一判定整理记录列表：存在 status 且 dest 以 /Media/ 开头的记录 -> success；
+        有记录但无成功 -> failed；空 -> None（交由调用方决定）。"""
         if not records:
-            return "none"
+            return None
         for record in records:
             dest = str(getattr(record, "dest", "") or "")
             if getattr(record, "status", None) and dest.startswith("/Media/"):
                 return "success"
         return "failed"
+
+    def _content_root(self, torrent: Dict[str, Any]) -> str:
+        """由 qB 种子 save_path + name 推导内容根目录（归一化，兼容 Windows 反斜杠）。"""
+        save_path = str(torrent.get("save_path") or "").strip()
+        name = str(torrent.get("name") or "").strip()
+        if not save_path or not name:
+            return ""
+        root = os.path.normpath(os.path.join(save_path, name))
+        return root.replace("\\", "/")
 
     # ---------------------------------------------------------------- 删除动作
 
