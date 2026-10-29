@@ -10,7 +10,7 @@
 - 只读宿主数据：下载器走 DownloaderHelper；整理记录走 TransferHistoryOper.list_by_hash。
 - 不 import app.db.models；不改写任何 qB 状态（本版纯展示，无需卸载回滚）。
 """
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:  # 不同 MP 版本导入路径兼容
     from app.sdk.plugin import _PluginBase
@@ -53,6 +53,53 @@ class DownloadManagerEnh(_PluginBase):
 
     def get_state(self) -> bool:
         return bool(self._enabled)
+
+    # ------------------------------------------------------------------ 抽象方法补齐（_PluginBase 契约）
+    def get_api(self) -> List[Dict[str, Any]]:
+        return []
+
+    def stop_service(self) -> None:
+        """纯展示插件，无后台调度，无需清理。"""
+        return None
+
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._col(12, 4, self._switch("enabled", "启用插件",
+                                "开启后新增下载管理入口，补全各状态种子海报与识别信息")),
+                            self._col(12, 4, self._switch("hide_downloading", "隐藏下载中的种子",
+                                "原生已展示下载中，开启后聚焦做种/暂停/已完成等缺口")),
+                            self._col(12, 4, self._switch("only_mp_tag", "仅显示 MP 管理的种子",
+                                "只展示带 MOVIEPILOT 标签、由 MP 接管的种子")),
+                        ],
+                    },
+                ],
+            }
+        ], {
+            "enabled": False,
+            "hide_downloading": False,
+            "only_mp_tag": False,
+        }
+
+    @staticmethod
+    def _col(cols: int, md: int, content: dict) -> dict:
+        return {
+            "component": "VCol",
+            "props": {"cols": cols, "md": md},
+            "content": [content],
+        }
+
+    @staticmethod
+    def _switch(model: str, label: str, hint: str) -> dict:
+        return {
+            "component": "VSwitch",
+            "props": {"model": model, "label": label, "hint": hint, "persistent-hint": True},
+        }
 
     # ------------------------------------------------------------------ 入口页面
     def get_page(self) -> Optional[List[dict]]:
