@@ -235,11 +235,21 @@ class DownloadManagerEnh(_PluginBase):
         all_torrents: List[Any] = []
         for svc_name, svc in services.items():
             try:
-                torrents = svc.instance.get_torrents() or []
+                result = svc.instance.get_torrents()
             except Exception as err:  # pragma: no cover
                 logger.warning(f"{LOG_TAG}获取下载器[{svc_name}]种子失败：{err}")
                 continue
-            all_torrents.extend(torrents)
+            # Qbittorrent.get_torrents() 返回 (种子列表, 错误标志) 二元组，必须拆包；
+            # 旧代码直接 extend 把 (list, bool) 当成两个元素塞进列表，导致每个种子
+            # 都不是 dict、hash 全为空、整张表被跳过，最终只显示“未获取到任何种子”。
+            if isinstance(result, tuple) and len(result) == 2:
+                torrents, error = result
+            else:
+                torrents, error = (result or []), False
+            if error:
+                logger.warning(f"{LOG_TAG}下载器[{svc_name}]未连接或返回错误，已跳过")
+                continue
+            all_torrents.extend(torrents or [])
         if not all_torrents:
             return [], {}
 
