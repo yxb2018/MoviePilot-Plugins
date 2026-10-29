@@ -60,5 +60,38 @@
     },
     "icon": "icons/ptlibrarycheck.png",
     "release": false
+  },
+  "DownloadManagerEnh": {
+    "name": "下载管理增强",
+    "description": "补全 qBittorrent 各状态种子的海报与识别信息（原生仅展示下载中），并标记 MP 管理的种子。第一版：新增下载管理入口，按 hash 匹配整理记录补全海报。",
+    "labels": "下载",
+    "version": "1.0.0",
+    "icon": "downloadmanagerenh.png",
+    "author": "yxb2018",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "初始版本：新增下载管理入口；拉取 qBittorrent 全量种子（含做种中/已暂停/已完成），按 hash 匹配整理记录补全海报与片名，标记 MP 管理种子（MOVIEPILOT 标签）。"
+    },
+    "config": [
+      {
+        "key": "enabled",
+        "label": "启用插件",
+        "input_type": "switch",
+        "default": false
+      },
+      {
+        "key": "hide_downloading",
+        "label": "隐藏下载中的种子（原生已展示，聚焦缺口）",
+        "input_type": "switch",
+        "default": false
+      },
+      {
+        "key": "only_mp_tag",
+        "label": "仅显示 MP 管理的种子（含 MOVIEPILOT 标签）",
+        "input_type": "switch",
+        "default": false
+      }
+    ]
   }
 }
