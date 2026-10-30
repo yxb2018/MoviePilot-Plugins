@@ -88,7 +88,7 @@ class DownloadManagerEnh(_PluginBase):
     plugin_name = "下载管理增强"
     plugin_desc = "补全 qBittorrent 各状态种子的海报与识别信息，并支持对种子执行恢复/暂停/校验/删除/标签等操作。"
     plugin_icon = "downloadmanagerenh.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_config_prefix = "downloadmanagerenh_"
 
     # ------------------------------------------------------------------ 配置项
@@ -765,6 +765,10 @@ class DownloadManagerEnh(_PluginBase):
         out.append(header)
         if toolbar:
             out.append(toolbar)
+        # 标签二级菜单：独立卡片，置于表格上方
+        panel_card = self._tag_panel_card(rows)
+        if panel_card:
+            out.append(panel_card)
         out.extend([table_desktop, mobile])
         return out
 
@@ -878,9 +882,9 @@ class DownloadManagerEnh(_PluginBase):
         return btns
 
     # ------------------------------------------------------------------ 标签二级菜单
-    def _tag_panel(self, mode: str, hashes: List[str],
-                   row: Optional[Dict[str, Any]] = None) -> dict:
-        """标签二级菜单：打标签 = 选已有标签 / 新建标签；去标签 = 从种子移除 / 删除标签定义。"""
+    def _tag_panel_blocks(self, mode: str, hashes: List[str],
+                          row: Optional[Dict[str, Any]] = None) -> List[dict]:
+        """标签二级菜单内容块：打标签 = 选已有标签 / 新建标签；去标签 = 从种子移除 / 删除标签定义。"""
         all_tags = self._get_all_tags()
         blocks: List[dict] = []
 
@@ -936,23 +940,31 @@ class DownloadManagerEnh(_PluginBase):
 
         blocks.append({"component": "div", "props": {"class": "d-flex flex-wrap mt-2"},
                        "content": [self._act_btn("关闭", "tag_menu_close", [], "secondary")]})
-        return {
-            "component": "div",
-            "props": {"class": "pa-2 mt-1",
-                      "style": "border:1px dashed rgba(255,255,255,.3);border-radius:6px;"
-                               "background:rgba(255,255,255,.05);min-width:280px;"},
-            "content": blocks,
-        }
+        return blocks
 
-    def _tag_panel_for(self, hashes: List[str], row_hash: str = "",
-                       row: Optional[Dict[str, Any]] = None) -> Optional[dict]:
-        """当前二级菜单是否针对该目标（行内或批量）。"""
+    def _tag_panel_card(self, rows: List[Dict[str, Any]]) -> Optional[dict]:
+        """二级菜单独立成卡片（放在表格上方），避免嵌在单元格里被横向容器裁切。"""
         menu = self._tag_menu
         if not menu:
             return None
-        if (menu.get("row") or "") != (row_hash or ""):
-            return None
-        return self._tag_panel(menu.get("mode") or "tag", menu.get("hashes") or hashes, row)
+        mode = menu.get("mode") or "tag"
+        hashes = menu.get("hashes") or []
+        row_hash = menu.get("row") or ""
+        row = next((r for r in rows if r["hash"] == row_hash), None)
+        if row:
+            target = f"种子《{row['title']}》"
+        else:
+            target = f"当前可见的全部 {len(hashes)} 个种子"
+        blocks = self._tag_panel_blocks(mode, hashes, row)
+        return {
+            "component": "VCard",
+            "props": {"class": "pa-2 mb-3", "style": "border-left:3px solid #7c4dff;"},
+            "content": [
+                {"component": "VCardText", "props": {"class": "text-subtitle-1 pb-1"},
+                 "text": f"标签操作 · 目标：{target}"},
+                *blocks,
+            ],
+        }
 
     def _batch_toolbar(self, all_hashes: List[str]) -> Optional[dict]:
         if not all_hashes:
@@ -980,7 +992,7 @@ class DownloadManagerEnh(_PluginBase):
              "text": "说明：删除类按钮需点两次确认；「批量打标签 / 批量去标签」会展开二级菜单，"
                      "可选择 qB 已有标签、新建标签，或从种子移除 / 删除标签定义。"},
         ]
-        panel = self._tag_panel_for(all_hashes, "")
+        panel = None
         if panel:
             content.append(panel)
         return {
@@ -1058,7 +1070,6 @@ class DownloadManagerEnh(_PluginBase):
                         "class": "d-flex flex-wrap justify-end",
                         "style": "min-width:230px",
                     }, "content": self._action_buttons(r)},
-                    *[x for x in [self._tag_panel_for([r["hash"]], r["hash"], r)] if x],
                 ]},
             ],
         }
