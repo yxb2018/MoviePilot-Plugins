@@ -1,16 +1,22 @@
 """
-下载管理增强（DownloadManagerEnh）· V3 插件 · 第一版
+下载管理增强（DownloadManagerEnh）· V3 插件
 
-目标：在下载管理下新增入口，补全 qBittorrent 各状态种子的海报与识别信息。
+目标：在下载管理下新增入口，补全 qBittorrent 各状态种子的海报与识别信息，
+并支持对种子执行原生 qB Web UI 的常用操作（恢复/暂停/重新校验/删除/标签）。
+
 原生「下载管理」(GET /api/v1/download/) 只返回正在下载的种子，做种中/已暂停/已完成
 的种子根本没有统一展示入口。本插件直接拉取 qB 全量种子，按 hash 匹配 MP 整理记录
 （transfer_history）补全海报/片名/来源站，并标记 MP 管理的种子（qB 标签 MOVIEPILOT）。
 
 合规红线（moviepilot-plugin-dev）：
-- 只读宿主数据：下载器走 DownloaderHelper；整理记录走 TransferHistoryOper.list_by_hash。
-- 不 import app.db.models；不改写任何 qB 状态（本版纯展示，无需卸载回滚）。
+- 只读宿主数据：整理记录走 TransferHistoryOper.list_by_hash；种子列表走 DownloaderHelper。
+- 操作种子状态通过 qB 模块实例方法（start/stop/recheck/delete/tag）下发，属用户主动触发的
+  qB 操作，符合本插件定位；删除类动作一律走 POST（绝不 GET），避免浏览器预取误删。
+- 不 import app.db.models；不手动改 115 / MP DB / app.env / user.db；不 kill MP。
 """
 from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import Request
 
 try:  # 不同 MP 版本导入路径兼容
     from app.sdk.plugin import _PluginBase
@@ -19,22 +25,38 @@ except ImportError:  # pragma: no cover
 
 from app.sdk.services import DownloaderHelper
 from app.sdk.logging import logger
+from app.core.config import settings
 
 LOG_TAG = "[下载管理增强] "
+
+# 受支持的操作 -> 前端展示用中文标签
+_OPERATIONS: Dict[str, str] = {
+    "start": "恢复",
+    "stop": "暂停",
+    "recheck": "重新校验",
+    "delete": "删除(保留文件)",
+    "delete_files": "删除(含文件)",
+    "tag": "加标",
+    "untag": "去标",
+}
+
+# qB 处于「已暂停/已停止」的状态集合：这类种子显示「恢复」按钮，其余显示「暂停」。
+_PAUSED_STATES = {"pausedUP", "pausedDL", "stoppedUP", "stoppedDL"}
 
 
 class DownloadManagerEnh(_PluginBase):
     # ------------------------------------------------------------------ 元数据
     plugin_name = "下载管理增强"
-    plugin_desc = "补全 qBittorrent 各状态种子的海报与识别信息（原生仅展示下载中），并标记 MP 管理的种子。"
+    plugin_desc = "补全 qBittorrent 各状态种子的海报与识别信息，并支持对种子执行恢复/暂停/校验/删除/标签等操作。"
     plugin_icon = "downloadmanagerenh.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_config_prefix = "downloadmanagerenh_"
 
     # ------------------------------------------------------------------ 配置项
     _enabled: bool = False
     _hide_downloading: bool = False
     _only_mp_tag: bool = False
+    _operate_tag: str = "MOVIEPILOT"
 
     # qB 正在下载类状态：用于「隐藏下载中」时聚焦原生已覆盖的缺口
     _DOWNLOADING_STATES = {
@@ -50,16 +72,24 @@ class DownloadManagerEnh(_PluginBase):
             self._enabled = bool(config.get("enabled", False))
             self._hide_downloading = bool(config.get("hide_downloading", False))
             self._only_mp_tag = bool(config.get("only_mp_tag", False))
+            self._operate_tag = str(config.get("operate_tag") or "MOVIEPILOT").strip()
 
     def get_state(self) -> bool:
         return bool(self._enabled)
 
     # ------------------------------------------------------------------ 抽象方法补齐（_PluginBase 契约）
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [{
+            "path": "/operate",
+            "endpoint": self.api_operate,
+            "methods": ["POST"],
+            "auth": "apikey",
+            "summary": "对种子执行操作（恢复/暂停/校验/删除/标签）",
+            "description": "接收 action 与 hashes，按各下载器分发批量操作；删除类动作仅限 POST。",
+        }]
 
     def stop_service(self) -> None:
-        """纯展示插件，无后台调度，无需清理。"""
+        """无后台调度，无需清理。"""
         return None
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -78,12 +108,27 @@ class DownloadManagerEnh(_PluginBase):
                                 "只展示带 MOVIEPILOT 标签、由 MP 接管的种子")),
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._col(12, 6, {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "operate_tag",
+                                    "label": "批量打标/去标使用的标签",
+                                    "hint": "「加标/去标」及「全部加标/全部去标」按钮将作用在此标签上",
+                                    "persistent-hint": True,
+                                },
+                            }),
+                        ],
+                    },
                 ],
             }
         ], {
             "enabled": False,
             "hide_downloading": False,
             "only_mp_tag": False,
+            "operate_tag": "MOVIEPILOT",
         }
 
     @staticmethod
@@ -240,8 +285,6 @@ class DownloadManagerEnh(_PluginBase):
                 logger.warning(f"{LOG_TAG}获取下载器[{svc_name}]种子失败：{err}")
                 continue
             # Qbittorrent.get_torrents() 返回 (种子列表, 错误标志) 二元组，必须拆包；
-            # 旧代码直接 extend 把 (list, bool) 当成两个元素塞进列表，导致每个种子
-            # 都不是 dict、hash 全为空、整张表被跳过，最终只显示“未获取到任何种子”。
             if isinstance(result, tuple) and len(result) == 2:
                 torrents, error = result
             else:
@@ -321,31 +364,138 @@ class DownloadManagerEnh(_PluginBase):
             return f"{h}时{m}分"
         return f"{m}分"
 
+    # ------------------------------------------------------------------ 操作端点
+    async def api_operate(self, request: Request):
+        """
+        POST /api/v1/plugin/DownloadManagerEnh/operate
+        请求体：{"action": str, "hashes": [str], "tag": str(可选)}
+        删除类动作只接受 POST，避免浏览器预取/误点触发误删。
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return {"success": False, "message": "请求体解析失败，请确认使用 JSON 提交"}
+        if not isinstance(body, dict):
+            return {"success": False, "message": "请求体格式错误"}
+        action = str(body.get("action") or "").strip()
+        hashes = body.get("hashes") or []
+        tag = str(body.get("tag") or self._operate_tag or "").strip()
+        if action not in _OPERATIONS:
+            return {"success": False, "message": f"不支持的操作：{action}"}
+        if not isinstance(hashes, list) or not hashes:
+            return {"success": False, "message": "未提供种子哈希"}
+        hashes = [str(h).strip().lower() for h in hashes if str(h).strip()]
+        if not hashes:
+            return {"success": False, "message": "未提供有效种子哈希"}
+
+        ok_count, fail_count = self._do_operate(action, hashes, tag)
+        if ok_count == 0:
+            return {"success": False,
+                    "message": f"操作未生效（{fail_count} 个种子），请确认下载器已连接且种子仍存在"}
+        msg = f"已对 {ok_count} 个种子执行「{_OPERATIONS[action]}」"
+        if fail_count:
+            msg += f"，{fail_count} 个跳过/失败"
+        return {"success": True, "message": msg}
+
+    def _do_operate(self, action: str, hashes: List[str], tag: str) -> Tuple[int, int]:
+        """
+        按下载器分发操作。每个下载器只对自己的种子执行，避免把外来 hash 传给别的实例。
+        返回 (成功计数, 失败/跳过计数)。
+        """
+        services = self._get_qb_services()
+        if not services:
+            return 0, len(hashes)
+        wanted = set(hashes)
+        serviced: set = set()
+        ok_total = 0
+        fail_total = 0
+        for svc_name, svc in services.items():
+            try:
+                result = svc.instance.get_torrents()
+            except Exception as err:  # pragma: no cover
+                logger.warning(f"{LOG_TAG}操作前获取下载器[{svc_name}]种子失败：{err}")
+                continue
+            if isinstance(result, tuple) and len(result) == 2:
+                torrents, error = result
+            else:
+                torrents, error = (result or []), False
+            if error or not torrents:
+                continue
+            local_set = {self._t_hash(t).lower() for t in torrents if self._t_hash(t)}
+            target = [h for h in hashes if h in local_set]
+            if not target:
+                continue
+            try:
+                if action == "start":
+                    res = svc.instance.start_torrents(target)
+                elif action == "stop":
+                    res = svc.instance.stop_torrents(target)
+                elif action == "recheck":
+                    res = svc.instance.recheck_torrents(target)
+                elif action == "delete":
+                    res = svc.instance.delete_torrents(False, target)
+                elif action == "delete_files":
+                    res = svc.instance.delete_torrents(True, target)
+                elif action == "tag":
+                    res = svc.instance.set_torrents_tag(target, [tag]) if tag else False
+                elif action == "untag":
+                    res = svc.instance.remove_torrents_tag(target, tag) if tag else False
+                else:
+                    res = False
+            except Exception as err:
+                logger.error(f"{LOG_TAG}下载器[{svc_name}]执行[{action}]出错：{err}")
+                res = False
+            serviced.update(target)
+            if res:
+                ok_total += len(target)
+            else:
+                fail_total += len(target)
+        unmatched = wanted - serviced
+        fail_total += len(unmatched)
+        return ok_total, fail_total
+
     # ------------------------------------------------------------------ 渲染
     def _render(self, rows: List[Dict[str, Any]], state_counts: Dict[str, int]) -> List[dict]:
+        all_hashes = [r["hash"] for r in rows]
         cards = [self._stat_card(str(len(rows)), "合计种子")]
         for st, c in sorted(state_counts.items(), key=lambda x: -x[1]):
             cards.append(self._stat_card(str(c), st))
         header = {"component": "VRow", "content": cards}
+        toolbar = self._batch_toolbar(all_hashes)
+
+        # 桌面表格：中等屏及以上显示（hidden-sm-and-down）
         thead = {
             "component": "thead",
             "content": [
                 self._th("海报"), self._th("名称/片名"), self._th("状态"),
                 self._th("进度"), self._th("大小"), self._th("分享率"),
                 self._th("做种时长"), self._th("标签"), self._th("来源站"), self._th("MP管理"),
+                self._th("操作"),
             ],
         }
         trs = [self._row(r) for r in rows]
-        table = {
+        table_desktop = {
             "component": "VCol",
-            "props": {"cols": 12},
+            "props": {"cols": 12, "class": "hidden-sm-and-down"},
             "content": [{
                 "component": "VTable",
                 "props": {"hover": True, "density": "compact"},
                 "content": [thead, {"component": "tbody", "content": trs}],
             }],
         }
-        return [header, table]
+
+        # 手机卡片：小屏显示（hidden-md-and-up）
+        mobile = {
+            "component": "VCol",
+            "props": {"cols": 12, "class": "hidden-md-and-up"},
+            "content": [self._row_mobile(r) for r in rows],
+        }
+
+        out: List[dict] = [header]
+        if toolbar:
+            out.append(toolbar)
+        out.extend([table_desktop, mobile])
+        return out
 
     @staticmethod
     def _th(text: str) -> dict:
@@ -366,22 +516,99 @@ class DownloadManagerEnh(_PluginBase):
             }],
         }
 
-    def _row(self, r: Dict[str, Any]) -> dict:
+    # ------------------------------------------------------------------ 操作按钮
+    @staticmethod
+    def _act_btn(label: str, action: str, hashes: List[str], color: str,
+                 tag: Optional[str] = None) -> dict:
+        params: Dict[str, Any] = {"action": action, "hashes": hashes}
+        if tag:
+            params["tag"] = tag
+        return {
+            "component": "VBtn",
+            "props": {
+                "size": "x-small",
+                "variant": "tonal",
+                "color": color,
+                "class": "ma-1",
+            },
+            "text": label,
+            "events": {
+                "click": {
+                    "api": f"plugin/DownloadManagerEnh/operate?apikey={settings.API_TOKEN}",
+                    "method": "post",
+                    "params": params,
+                }
+            },
+        }
+
+    def _action_buttons(self, r: Dict[str, Any]) -> List[dict]:
+        h = r["hash"]
+        is_paused = r["state"] in _PAUSED_STATES
+        btns: List[dict] = []
+        if is_paused:
+            btns.append(self._act_btn("恢复", "start", [h], "success"))
+        else:
+            btns.append(self._act_btn("暂停", "stop", [h], "warning"))
+        btns.append(self._act_btn("校验", "recheck", [h], "info"))
+        btns.append(self._act_btn("删除", "delete", [h], "error"))
+        if self._operate_tag:
+            tag = self._operate_tag
+            btns.append(self._act_btn(f"+{tag}", "tag", [h], "primary", tag=tag))
+            btns.append(self._act_btn(f"-{tag}", "untag", [h], "secondary", tag=tag))
+        return btns
+
+    def _batch_toolbar(self, all_hashes: List[str]) -> Optional[dict]:
+        if not all_hashes:
+            return None
+        btns = [
+            self._act_btn("全部恢复", "start", all_hashes, "success"),
+            self._act_btn("全部暂停", "stop", all_hashes, "warning"),
+            self._act_btn("全部校验", "recheck", all_hashes, "info"),
+            self._act_btn("全部删除(留文件)", "delete", all_hashes, "error"),
+            self._act_btn("全部删除(含文件)", "delete_files", all_hashes, "error"),
+        ]
+        if self._operate_tag:
+            tag = self._operate_tag
+            btns.append(self._act_btn(f"全部 +{tag}", "tag", all_hashes, "primary", tag=tag))
+            btns.append(self._act_btn(f"全部 -{tag}", "untag", all_hashes, "secondary", tag=tag))
+        return {
+            "component": "VCard",
+            "props": {"class": "pa-2 mb-3"},
+            "content": [
+                {"component": "VCardText", "props": {"class": "text-subtitle-1 pb-1"},
+                 "text": "批量操作（作用于当前可见的全部种子）"},
+                {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": btns},
+            ],
+        }
+
+    # ------------------------------------------------------------------ 行渲染
+    @staticmethod
+    def _poster_img(r: Dict[str, Any]) -> dict:
         if r["poster"]:
-            poster_cell = {"component": "td", "content": [
+            return {"component": "img", "props": {
+                "src": r["poster"],
+                "style": "max-height:96px;max-width:100%;border-radius:4px;object-fit:cover;",
+            }}
+        return {"component": "div", "props": {"class": "text-caption"}, "text": "无海报"}
+
+    @staticmethod
+    def _poster_td(r: Dict[str, Any]) -> dict:
+        if r["poster"]:
+            return {"component": "td", "content": [
                 {"component": "img", "props": {
                     "src": r["poster"],
                     "style": "height:72px;border-radius:4px;object-fit:cover;",
                 }}
             ]}
-        else:
-            poster_cell = {"component": "td", "text": "无海报"}
+        return {"component": "td", "text": "无海报"}
+
+    def _row(self, r: Dict[str, Any]) -> dict:
         mp_badge = "是" if r["is_mp"] else "否"
         return {
             "component": "tr",
             "props": {"class": "text-sm"},
             "content": [
-                poster_cell,
+                self._poster_td(r),
                 {"component": "td", "text": r["title"]},
                 {"component": "td", "text": r["state"]},
                 {"component": "td", "text": f"{r['progress']:.1f}%"},
@@ -393,5 +620,36 @@ class DownloadManagerEnh(_PluginBase):
                 {"component": "td", "props": {
                     "class": "text-success" if r["is_mp"] else "text-medium-emphasis",
                 }, "text": mp_badge},
+                {"component": "td", "props": {"class": "text-no-wrap"},
+                 "content": self._action_buttons(r)},
+            ],
+        }
+
+    def _row_mobile(self, r: Dict[str, Any]) -> dict:
+        meta = [
+            {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"},
+             "text": r["title"]},
+            {"component": "div", "props": {"class": "text-caption"},
+             "text": f"状态：{r['state']}　进度：{r['progress']:.1f}%"},
+            {"component": "div", "props": {"class": "text-caption"},
+             "text": f"大小：{r['size']}　分享率：{r['ratio']:.2f}　做种：{r['seeding']}"},
+            {"component": "div", "props": {"class": "text-caption"},
+             "text": f"标签：{r['tags'] or '—'}　来源站：{r['site'] or '—'}"},
+            {"component": "div", "props": {
+                "class": "text-caption " + ("text-success" if r["is_mp"] else "text-medium-emphasis")},
+             "text": f"MP管理：{'是' if r['is_mp'] else '否'}"},
+        ]
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-2 pa-2"},
+            "content": [
+                {"component": "VRow", "props": {"class": "ma-0"}, "content": [
+                    {"component": "VCol", "props": {"cols": 4, "class": "pa-1"},
+                     "content": [self._poster_img(r)]},
+                    {"component": "VCol", "props": {"cols": 8, "class": "pa-1"},
+                     "content": meta},
+                ]},
+                {"component": "div", "props": {"class": "d-flex flex-wrap mt-1"},
+                 "content": self._action_buttons(r)},
             ],
         }

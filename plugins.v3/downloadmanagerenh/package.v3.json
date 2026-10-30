@@ -1,14 +1,15 @@
 {
   "DownloadManagerEnh": {
     "name": "下载管理增强",
-    "description": "补全 qBittorrent 各状态种子的海报与识别信息（原生仅展示下载中），并标记 MP 管理的种子。第一版：新增下载管理入口，按 hash 匹配整理记录补全海报。",
+    "description": "补全 qBittorrent 各状态种子的海报与识别信息，并支持对种子执行原生 qB Web UI 操作：恢复/暂停/重新校验/删除(可选含文件)/加标去标。",
     "labels": "下载",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "downloadmanagerenh.png",
     "author": "yxb2018",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.0": "新增种子操作能力与原生一致的常用动作：每行及「批量操作」栏提供恢复/暂停/重新校验/删除(保留文件)/删除(含文件)，以及基于配置标签的加标/去标；删除类动作一律走 POST 避免浏览器预取误删。页面改为响应式：中等屏及以上用宽表展示，手机小屏自动切换为卡片布局，解决手机版排版缺失。",
       "v1.0.0": "初始版本：新增下载管理入口；拉取 qBittorrent 全量种子（含做种中/已暂停/已完成），按 hash 匹配整理记录补全海报与片名，标记 MP 管理种子（MOVIEPILOT 标签）。"
     },
     "config": [
@@ -29,6 +30,12 @@
         "label": "仅显示 MP 管理的种子（含 MOVIEPILOT 标签）",
         "input_type": "switch",
         "default": false
+      },
+      {
+        "key": "operate_tag",
+        "label": "批量打标/去标使用的标签",
+        "input_type": "text",
+        "default": "MOVIEPILOT"
       }
     ]
   }
