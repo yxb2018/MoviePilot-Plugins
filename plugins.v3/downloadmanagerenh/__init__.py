@@ -54,7 +54,7 @@ class DownloadManagerEnh(_PluginBase):
     plugin_name = "下载管理增强"
     plugin_desc = "补全 qBittorrent 各状态种子的海报与识别信息，并支持对种子执行恢复/暂停/校验/删除/标签等操作。"
     plugin_icon = "downloadmanagerenh.png"
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_config_prefix = "downloadmanagerenh_"
 
     # ------------------------------------------------------------------ 配置项
@@ -557,7 +557,7 @@ class DownloadManagerEnh(_PluginBase):
                 "props": {"style": "overflow-x:auto"},
                 "content": [{
                     "component": "VTable",
-                    "props": {"hover": True, "density": "compact", "style": "min-width:1080px"},
+                    "props": {"hover": True, "density": "compact", "style": "min-width:920px"},
                     "content": [thead, {"component": "tbody", "content": trs}],
                 }],
             }],
@@ -634,7 +634,8 @@ class DownloadManagerEnh(_PluginBase):
     # ------------------------------------------------------------------ 操作按钮
     @staticmethod
     def _act_btn(label: str, action: str, hashes: List[str], color: str,
-                 tag: Optional[str] = None, confirm: Optional[str] = None) -> dict:
+                 tag: Optional[str] = None, confirm: Optional[str] = None,
+                 variant: str = "text") -> dict:
         params: Dict[str, Any] = {"action": action, "hashes": hashes}
         if tag:
             params["tag"] = tag
@@ -644,9 +645,10 @@ class DownloadManagerEnh(_PluginBase):
             "component": "VBtn",
             "props": {
                 "size": "x-small",
-                "variant": "tonal",
+                "variant": variant,
                 "color": color,
-                "class": "ma-1 text-no-wrap",
+                # 行内按钮用紧凑间距（text 变体），批量栏用 tonal 突出
+                "class": "ma-1 text-no-wrap" if variant == "tonal" else "mr-1 my-1 text-no-wrap",
             },
             "text": label,
             "events": {
@@ -690,18 +692,20 @@ class DownloadManagerEnh(_PluginBase):
         pending_del = self._pending_token("delete", all_hashes)
         pending_del_files = self._pending_token("delete_files", all_hashes)
         btns = [
-            self._act_btn("全部恢复", "start", all_hashes, "success"),
-            self._act_btn("全部暂停", "stop", all_hashes, "warning"),
-            self._act_btn("全部校验", "recheck", all_hashes, "info"),
+            self._act_btn("全部恢复", "start", all_hashes, "success", variant="tonal"),
+            self._act_btn("全部暂停", "stop", all_hashes, "warning", variant="tonal"),
+            self._act_btn("全部校验", "recheck", all_hashes, "info", variant="tonal"),
             self._act_btn("确认全部删除(留文件)" if pending_del else "全部删除(留文件)",
-                          "delete", all_hashes, "error", confirm=pending_del),
+                          "delete", all_hashes, "error", variant="tonal", confirm=pending_del),
             self._act_btn("确认全部删除(含文件)" if pending_del_files else "全部删除(含文件)",
-                          "delete_files", all_hashes, "error", confirm=pending_del_files),
+                          "delete_files", all_hashes, "error", variant="tonal", confirm=pending_del_files),
         ]
         if self._operate_tag:
             tag = self._operate_tag
-            btns.append(self._act_btn(f"全部 +{tag}", "tag", all_hashes, "primary", tag=tag))
-            btns.append(self._act_btn(f"全部 -{tag}", "untag", all_hashes, "secondary", tag=tag))
+            btns.append(self._act_btn(f"全部 +{tag}", "tag", all_hashes, "primary",
+                                      variant="tonal", tag=tag))
+            btns.append(self._act_btn(f"全部 -{tag}", "untag", all_hashes, "secondary",
+                                      variant="tonal", tag=tag))
         return {
             "component": "VCard",
             "props": {"class": "pa-2 mb-3"},
@@ -728,6 +732,7 @@ class DownloadManagerEnh(_PluginBase):
         """
         用 Vuetify 的 VImg 渲染海报（与 MP 原生下载页一致：固定尺寸 + cover 裁剪 +
         自带占位/懒加载），避免裸 img 在窄列里被压成细条。
+        eager=True：VImg 默认懒加载，表格里行未进视口就不会出图，必须强制加载。
         """
         if not r["poster"]:
             return cls._poster_box(size)
@@ -739,6 +744,7 @@ class DownloadManagerEnh(_PluginBase):
                 "height": int(size * 1.5),
                 "aspect-ratio": "2/3",
                 "cover": True,
+                "eager": True,
                 "class": "rounded",
             },
         }
@@ -773,10 +779,10 @@ class DownloadManagerEnh(_PluginBase):
                 {"component": "td", "props": {"class": "text-no-wrap"}, "text": f"{r['ratio']:.2f}"},
                 {"component": "td", "props": {"class": "text-no-wrap"}, "text": r["seeding"]},
                 {"component": "td", "props": {"class": "text-caption"}, "text": r["tags"]},
-                {"component": "td", "content": [
+                {"component": "td", "props": {"style": "min-width:230px"}, "content": [
                     {"component": "div", "props": {
                         "class": "d-flex flex-wrap justify-end",
-                        "style": "min-width:260px",
+                        "style": "min-width:230px",
                     }, "content": self._action_buttons(r)},
                 ]},
             ],
