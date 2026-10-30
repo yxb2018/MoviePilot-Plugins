@@ -40,7 +40,17 @@ _OPERATIONS: Dict[str, str] = {
     "delete_files": "删除(含文件)",
     "tag": "打标签",
     "untag": "去标签",
+    # 标签二级菜单（对齐 qB Web UI 的标签管理）
+    "tag_menu": "标签操作",
+    "tag_menu_close": "关闭标签菜单",
+    "tag_apply": "打标签",
+    "tag_remove": "去标签",
+    "tag_create": "新建标签",
+    "tag_delete": "删除标签",
 }
+
+# 需要二次确认的破坏性操作（点击第一次只登记待确认）
+_CONFIRM_REQUIRED = {"delete", "delete_files", "tag_delete"}
 
 # qB 处于「已暂停/已停止」的状态集合：这类种子显示「恢复」按钮，其余显示「暂停」。
 _PAUSED_STATES = {"pausedUP", "pausedDL", "stoppedUP", "stoppedDL"}
@@ -78,19 +88,22 @@ class DownloadManagerEnh(_PluginBase):
     plugin_name = "下载管理增强"
     plugin_desc = "补全 qBittorrent 各状态种子的海报与识别信息，并支持对种子执行恢复/暂停/校验/删除/标签等操作。"
     plugin_icon = "downloadmanagerenh.png"
-    plugin_version = "1.2.4"
+    plugin_version = "1.3.0"
     plugin_config_prefix = "downloadmanagerenh_"
 
     # ------------------------------------------------------------------ 配置项
     _enabled: bool = False
     _hide_downloading: bool = False
     _only_mp_tag: bool = False
-    _operate_tag: str = "MOVIEPILOT"
+    # 新建标签的候选名（逗号分隔）；qB WebUI 里是即时输入，静态页无输入框，故走配置
+    _new_tags: str = "MOVIEPILOT"
 
     # 上一次操作结果：前端事件回调会吞掉接口返回，故在页面上以横幅反馈
     _last_result: Optional[Dict[str, Any]] = None
-    # 删除类操作的待确认记录：token -> {"action", "hashes", "ts"}
+    # 待确认的破坏性操作：token -> {"action", "hashes", "tag", "ts"}
     _pending_deletes: Dict[str, Dict[str, Any]] = {}
+    # 标签二级菜单状态：{"mode": "tag"|"untag", "hashes": [...], "row": hash|"", "ts": ts}
+    _tag_menu: Optional[Dict[str, Any]] = None
 
     # qB 正在下载类状态：用于「隐藏下载中」时聚焦原生已覆盖的缺口
     _DOWNLOADING_STATES = {
@@ -106,7 +119,10 @@ class DownloadManagerEnh(_PluginBase):
             self._enabled = bool(config.get("enabled", False))
             self._hide_downloading = bool(config.get("hide_downloading", False))
             self._only_mp_tag = bool(config.get("only_mp_tag", False))
-            self._operate_tag = str(config.get("operate_tag") or "MOVIEPILOT").strip()
+            # 兼容旧配置项 operate_tag（旧版本是固定标签，新版本改为新建标签候选）
+            self._new_tags = str(
+                config.get("new_tags") or config.get("operate_tag") or "MOVIEPILOT"
+            ).strip()
 
     def get_state(self) -> bool:
         return bool(self._enabled)
@@ -148,10 +164,11 @@ class DownloadManagerEnh(_PluginBase):
                             self._col(12, 6, {
                                 "component": "VTextField",
                                 "props": {
-                                    "model": "operate_tag",
-                                    "label": "打标签/去标签使用的标签名",
-                                    "hint": "MP 默认用 MOVIEPILOT 标签标记「由 MP 接管的种子」。"
-                                            "「打标签」= 给种子加上该标签，「去标签」= 移除该标签，可改成任意标签名",
+                                    "model": "new_tags",
+                                    "label": "新建标签的候选名（英文逗号分隔多个）",
+                                    "hint": "qB WebUI 里标签是即时输入新建的，本插件页面无输入框，"
+                                            "故把常用标签名填在这里：点「打标签」→「新建标签」即可创建并打上。"
+                                            "MP 默认用 MOVIEPILOT 标记自己接管的种子",
                                     "persistent-hint": True,
                                 },
                             }),
@@ -163,7 +180,7 @@ class DownloadManagerEnh(_PluginBase):
             "enabled": False,
             "hide_downloading": False,
             "only_mp_tag": False,
-            "operate_tag": "MOVIEPILOT",
+            "new_tags": "MOVIEPILOT",
         }
 
     @staticmethod
@@ -410,9 +427,10 @@ class DownloadManagerEnh(_PluginBase):
     async def api_operate(self, request: Request):
         """
         POST /api/v1/plugin/DownloadManagerEnh/operate
-        请求体：{"action": str, "hashes": [str], "tag": str(可选), "confirm": str(可选)}
+        请求体：{"action": str, "hashes": [str], "tag": str(可选), "confirm": str(可选),
+                 "mode": "tag"|"untag"(可选), "row": str(可选)}
         删除类动作只接受 POST，避免浏览器预取/误点触发误删；
-        且删除走「两段式确认」：第一次仅登记待确认，第二次带 confirm token 才真正执行。
+        删除/删标签走「两段式确认」：第一次仅登记待确认，第二次带 confirm token 才真正执行。
         """
         try:
             body = await request.json()
@@ -422,16 +440,80 @@ class DownloadManagerEnh(_PluginBase):
             return self._finish(False, "请求体格式错误")
         action = str(body.get("action") or "").strip()
         hashes = body.get("hashes") or []
-        tag = str(body.get("tag") or self._operate_tag or "").strip()
+        tag = str(body.get("tag") or "").strip()
         confirm = str(body.get("confirm") or "").strip()
+        mode = str(body.get("mode") or "").strip()
+        row = str(body.get("row") or "").strip()
 
         # 清除结果横幅
         if action == "clear_result":
             self._last_result = None
             return {"success": True, "message": "已清除提示"}
 
+        # 标签二级菜单：打开 / 关闭
+        if action == "tag_menu":
+            if mode not in ("tag", "untag"):
+                return self._finish(False, "未指定标签操作类型")
+            if not isinstance(hashes, list) or not hashes:
+                return self._finish(False, "未提供种子哈希")
+            self._tag_menu = {
+                "mode": mode,
+                "hashes": [str(h).strip().lower() for h in hashes if str(h).strip()],
+                "row": row,
+                "ts": time.time(),
+            }
+            tip = "为选中种子添加标签（可选已有标签，或新建一个）" if mode == "tag" \
+                else "从选中种子移除标签，或彻底删除某个标签"
+            return self._finish(True, tip)
+        if action == "tag_menu_close":
+            self._tag_menu = None
+            return self._finish(True, "已关闭标签菜单")
+
         if action not in _OPERATIONS:
             return self._finish(False, f"不支持的操作：{action}")
+
+        # 标签类：应用已有标签 / 新建标签 / 移除标签 / 删除标签定义
+        if action in ("tag_apply", "tag_remove", "tag_create"):
+            if not tag:
+                return self._finish(False, "未指定标签名")
+            if not isinstance(hashes, list) or not hashes:
+                return self._finish(False, "未提供种子哈希")
+            hashes = [str(h).strip().lower() for h in hashes if str(h).strip()]
+            if not hashes:
+                return self._finish(False, "未提供有效种子哈希")
+            if action == "tag_apply":
+                ok_count, fail_count = self._do_operate("tag", hashes, tag)
+            elif action == "tag_remove":
+                ok_count, fail_count = self._do_operate("untag", hashes, tag)
+            else:
+                ok_count, fail_count = self._do_tag_create(tag, hashes)
+            if ok_count == 0:
+                return self._finish(False, f"操作未生效（{fail_count} 个种子），请确认下载器已连接且种子仍存在")
+            msg = f"已对 {ok_count} 个种子执行「{_OPERATIONS[action]}：{tag}」"
+            if fail_count:
+                msg += f"，{fail_count} 个跳过/失败"
+            return self._finish(True, msg)
+
+        if action == "tag_delete":
+            if not tag:
+                return self._finish(False, "未指定要删除的标签")
+            if not confirm:
+                token = self._stage_delete("tag_delete", [], tag=tag)
+                return self._finish(
+                    True,
+                    f"删除标签「{tag}」会影响 qB 中所有带该标签的种子，请再次点击「确认删除标签」执行；本次未删除",
+                    extra={"confirm": token},
+                )
+            staged = self._pending_deletes.get(confirm)
+            if not staged or staged.get("action") != "tag_delete" or staged.get("tag") != tag:
+                return self._finish(False, "确认已失效（可能已超时），请重新点击删除标签")
+            if time.time() - float(staged.get("ts") or 0) > _PENDING_TTL:
+                self._pending_deletes.pop(confirm, None)
+                return self._finish(False, f"确认已超过 {_PENDING_TTL} 秒未确认，已自动作废，请重新点击")
+            self._pending_deletes.pop(confirm, None)
+            ok = self._do_tag_delete(tag)
+            return self._finish(bool(ok), f"已删除标签「{tag}」" if ok else f"删除标签「{tag}」失败")
+
         if not isinstance(hashes, list) or not hashes:
             return self._finish(False, "未提供种子哈希")
         hashes = [str(h).strip().lower() for h in hashes if str(h).strip()]
@@ -475,18 +557,19 @@ class DownloadManagerEnh(_PluginBase):
             res.update(extra)
         return res
 
-    def _stage_delete(self, action: str, hashes: List[str]) -> str:
-        """登记一次待确认的删除操作，返回确认 token。"""
+    def _stage_delete(self, action: str, hashes: List[str], tag: str = "") -> str:
+        """登记一次待确认的破坏性操作，返回确认 token。"""
         now = time.time()
         for token in [t for t, v in self._pending_deletes.items()
                       if now - float(v.get("ts") or 0) > _PENDING_TTL]:
             self._pending_deletes.pop(token, None)
         token = uuid.uuid4().hex[:12]
-        self._pending_deletes[token] = {"action": action, "hashes": list(hashes), "ts": now}
+        self._pending_deletes[token] = {
+            "action": action, "hashes": list(hashes), "tag": tag, "ts": now}
         return token
 
-    def _pending_token(self, action: str, hashes: List[str]) -> Optional[str]:
-        """查找与「操作 + 种子集合」完全一致的待确认 token（用于把按钮变成「确认删除」）。"""
+    def _pending_token(self, action: str, hashes: List[str], tag: str = "") -> Optional[str]:
+        """查找与「操作 + 种子集合 + 标签」完全一致的待确认 token。"""
         now = time.time()
         wanted = set(hashes)
         for token in list(self._pending_deletes.keys()):
@@ -496,22 +579,82 @@ class DownloadManagerEnh(_PluginBase):
                 continue
             if staged.get("action") != action:
                 continue
+            if (staged.get("tag") or "") != (tag or ""):
+                continue
             if set(staged.get("hashes") or []) == wanted:
                 return token
         return None
 
-    def _do_operate(self, action: str, hashes: List[str], tag: str) -> Tuple[int, int]:
-        """
-        按下载器分发操作。每个下载器只对自己的种子执行，避免把外来 hash 传给别的实例。
-        返回 (成功计数, 失败/跳过计数)。
-        """
-        services = self._get_qb_services()
-        if not services:
-            return 0, len(hashes)
-        wanted = set(hashes)
-        serviced: set = set()
+    # ------------------------------------------------------------------ 标签管理
+    def _get_all_tags(self) -> List[str]:
+        """列出 qB 中现存的全部标签（/api/v2/torrents/tags）。"""
+        tags = set()
+        for svc_name, svc in self._get_qb_services().items():
+            qbc = getattr(svc.instance, "qbc", None)
+            if not qbc:
+                continue
+            try:
+                raw = qbc.torrents_tags()
+            except Exception as err:  # pragma: no cover
+                logger.warning(f"{LOG_TAG}获取下载器[{svc_name}]标签列表失败：{err}")
+                continue
+            items = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
+            for item in items:
+                name = str(item).strip()
+                if name:
+                    tags.add(name)
+        return sorted(tags)
+
+    def _new_tag_candidates(self) -> List[str]:
+        return [t.strip() for t in str(self._new_tags or "").split(",") if t.strip()]
+
+    def _do_tag_create(self, tag: str, hashes: List[str]) -> Tuple[int, int]:
+        """新建标签（/torrents/createTags）并给指定种子打上（/torrents/addTags）。"""
         ok_total = 0
         fail_total = 0
+        for svc_name, svc, target in self._group_by_service(hashes):
+            qbc = getattr(svc.instance, "qbc", None)
+            if not qbc:
+                fail_total += len(target)
+                continue
+            try:
+                qbc.torrents_create_tags(tags=tag)
+            except Exception as err:
+                logger.error(f"{LOG_TAG}下载器[{svc_name}]新建标签[{tag}]失败：{err}")
+                fail_total += len(target)
+                continue
+            try:
+                res = svc.instance.set_torrents_tag(target, [tag])
+            except Exception as err:
+                logger.error(f"{LOG_TAG}下载器[{svc_name}]新建后打标签失败：{err}")
+                res = False
+            if res:
+                ok_total += len(target)
+            else:
+                fail_total += len(target)
+        return ok_total, fail_total
+
+    def _do_tag_delete(self, tag: str) -> bool:
+        """彻底删除标签定义（/torrents/deleteTags），该标签会从所有种子上消失。"""
+        done = False
+        for svc_name, svc in self._get_qb_services().items():
+            qbc = getattr(svc.instance, "qbc", None)
+            if not qbc:
+                continue
+            try:
+                qbc.torrents_delete_tags(tags=tag)
+                done = True
+            except Exception as err:
+                logger.error(f"{LOG_TAG}下载器[{svc_name}]删除标签[{tag}]失败：{err}")
+        return done
+
+    def _group_by_service(self, hashes: List[str]) -> List[Tuple[str, Any, List[str]]]:
+        """把目标 hash 按所属下载器分组，只把该下载器自己的种子交给它。"""
+        services = self._get_qb_services()
+        if not services:
+            return []
+        wanted = set(hashes)
+        groups: List[Tuple[str, Any, List[str]]] = []
         for svc_name, svc in services.items():
             try:
                 result = svc.instance.get_torrents()
@@ -526,8 +669,22 @@ class DownloadManagerEnh(_PluginBase):
                 continue
             local_set = {self._t_hash(t).lower() for t in torrents if self._t_hash(t)}
             target = [h for h in hashes if h in local_set]
-            if not target:
-                continue
+            if target:
+                groups.append((svc_name, svc, target))
+        return groups
+
+    def _do_operate(self, action: str, hashes: List[str], tag: str) -> Tuple[int, int]:
+        """
+        按下载器分发操作。每个下载器只对自己的种子执行，避免把外来 hash 传给别的实例。
+        返回 (成功计数, 失败/跳过计数)。
+        """
+        groups = self._group_by_service(hashes)
+        if not groups:
+            return 0, len(hashes)
+        serviced: set = set()
+        ok_total = 0
+        fail_total = 0
+        for svc_name, svc, target in groups:
             try:
                 if action == "start":
                     res = svc.instance.start_torrents(target)
@@ -553,7 +710,7 @@ class DownloadManagerEnh(_PluginBase):
                 ok_total += len(target)
             else:
                 fail_total += len(target)
-        unmatched = wanted - serviced
+        unmatched = set(hashes) - serviced
         fail_total += len(unmatched)
         return ok_total, fail_total
 
@@ -666,12 +823,14 @@ class DownloadManagerEnh(_PluginBase):
     @staticmethod
     def _act_btn(label: str, action: str, hashes: List[str], color: str,
                  tag: Optional[str] = None, confirm: Optional[str] = None,
-                 variant: str = "text") -> dict:
+                 variant: str = "text", extra: Optional[Dict[str, Any]] = None) -> dict:
         params: Dict[str, Any] = {"action": action, "hashes": hashes}
         if tag:
             params["tag"] = tag
         if confirm:
             params["confirm"] = confirm
+        if extra:
+            params.update(extra)
         return {
             "component": "VBtn",
             "props": {
@@ -711,11 +870,89 @@ class DownloadManagerEnh(_PluginBase):
             btns.append(self._act_btn("确认删文件", "delete_files", [h], "error", confirm=pending_del_files))
         else:
             btns.append(self._act_btn("删文件", "delete_files", [h], "error"))
-        if self._operate_tag:
-            tag = self._operate_tag
-            btns.append(self._act_btn("打标签", "tag", [h], "primary", tag=tag))
-            btns.append(self._act_btn("去标签", "untag", [h], "secondary", tag=tag))
+        # 标签：一级按钮只负责展开二级菜单（选已有标签 / 新建标签 / 删除标签）
+        btns.append(self._act_btn("打标签", "tag_menu", [h], "primary",
+                                  extra={"mode": "tag", "row": h}))
+        btns.append(self._act_btn("去标签", "tag_menu", [h], "secondary",
+                                  extra={"mode": "untag", "row": h}))
         return btns
+
+    # ------------------------------------------------------------------ 标签二级菜单
+    def _tag_panel(self, mode: str, hashes: List[str],
+                   row: Optional[Dict[str, Any]] = None) -> dict:
+        """标签二级菜单：打标签 = 选已有标签 / 新建标签；去标签 = 从种子移除 / 删除标签定义。"""
+        all_tags = self._get_all_tags()
+        blocks: List[dict] = []
+
+        if mode == "tag":
+            blocks.append({"component": "div", "props": {"class": "text-caption font-weight-bold"},
+                           "text": "① 选择已有标签（直接给选中种子打上）"})
+            if all_tags:
+                blocks.append({"component": "div", "props": {"class": "d-flex flex-wrap"},
+                               "content": [self._act_btn(t, "tag_apply", hashes, "primary", tag=t)
+                                           for t in all_tags]})
+            else:
+                blocks.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+                               "text": "qB 中还没有任何标签"})
+            blocks.append({"component": "div", "props": {"class": "text-caption font-weight-bold mt-2"},
+                           "text": "② 新建标签（qB 中创建后自动打上）"})
+            candidates = self._new_tag_candidates()
+            if candidates:
+                blocks.append({"component": "div", "props": {"class": "d-flex flex-wrap"},
+                               "content": [self._act_btn(f"＋{t}", "tag_create", hashes, "success", tag=t)
+                                           for t in candidates]})
+                blocks.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+                               "text": "（新建标签名可在插件设置里配置，多个用英文逗号分隔）"})
+            else:
+                blocks.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+                               "text": "未配置新建标签名，请到插件设置里填写"})
+        else:
+            cur = [t.strip() for t in str((row or {}).get("tags") or "").split(",") if t.strip()]
+            blocks.append({"component": "div", "props": {"class": "text-caption font-weight-bold"},
+                           "text": "① 从选中种子上移除标签"})
+            if cur:
+                blocks.append({"component": "div", "props": {"class": "d-flex flex-wrap"},
+                               "content": [self._act_btn(f"－{t}", "tag_remove", hashes, "warning", tag=t)
+                                           for t in cur]})
+            else:
+                blocks.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+                               "text": "选中种子当前没有标签"})
+            blocks.append({"component": "div", "props": {"class": "text-caption font-weight-bold mt-2"},
+                           "text": "② 删除标签定义（qB 中彻底删除，所有带该标签的种子都会受影响）"})
+            if all_tags:
+                del_btns = []
+                for t in all_tags:
+                    pending = self._pending_token("tag_delete", [], tag=t)
+                    if pending:
+                        del_btns.append(self._act_btn(f"确认删除标签「{t}」", "tag_delete", [], "error",
+                                                      tag=t, confirm=pending))
+                    else:
+                        del_btns.append(self._act_btn(f"✕ {t}", "tag_delete", [], "error", tag=t))
+                blocks.append({"component": "div", "props": {"class": "d-flex flex-wrap"},
+                               "content": del_btns})
+            else:
+                blocks.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+                               "text": "qB 中还没有任何标签"})
+
+        blocks.append({"component": "div", "props": {"class": "d-flex flex-wrap mt-2"},
+                       "content": [self._act_btn("关闭", "tag_menu_close", [], "secondary")]})
+        return {
+            "component": "div",
+            "props": {"class": "pa-2 mt-1",
+                      "style": "border:1px dashed rgba(255,255,255,.3);border-radius:6px;"
+                               "background:rgba(255,255,255,.05);min-width:280px;"},
+            "content": blocks,
+        }
+
+    def _tag_panel_for(self, hashes: List[str], row_hash: str = "",
+                       row: Optional[Dict[str, Any]] = None) -> Optional[dict]:
+        """当前二级菜单是否针对该目标（行内或批量）。"""
+        menu = self._tag_menu
+        if not menu:
+            return None
+        if (menu.get("row") or "") != (row_hash or ""):
+            return None
+        return self._tag_panel(menu.get("mode") or "tag", menu.get("hashes") or hashes, row)
 
     def _batch_toolbar(self, all_hashes: List[str]) -> Optional[dict]:
         if not all_hashes:
@@ -730,24 +967,26 @@ class DownloadManagerEnh(_PluginBase):
                           "delete", all_hashes, "error", variant="tonal", confirm=pending_del),
             self._act_btn("确认全部删除(含文件)" if pending_del_files else "全部删除(含文件)",
                           "delete_files", all_hashes, "error", variant="tonal", confirm=pending_del_files),
+            self._act_btn("批量打标签", "tag_menu", all_hashes, "primary", variant="tonal",
+                          extra={"mode": "tag", "row": ""}),
+            self._act_btn("批量去标签", "tag_menu", all_hashes, "secondary", variant="tonal",
+                          extra={"mode": "untag", "row": ""}),
         ]
-        if self._operate_tag:
-            tag = self._operate_tag
-            btns.append(self._act_btn(f"全部打标签(＋{tag})", "tag", all_hashes, "primary",
-                                      variant="tonal", tag=tag))
-            btns.append(self._act_btn(f"全部去标签(－{tag})", "untag", all_hashes, "secondary",
-                                      variant="tonal", tag=tag))
+        content: List[dict] = [
+            {"component": "VCardText", "props": {"class": "text-subtitle-1 pb-1"},
+             "text": "批量操作（作用于当前可见的全部种子）"},
+            {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": btns},
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"},
+             "text": "说明：删除类按钮需点两次确认；「批量打标签 / 批量去标签」会展开二级菜单，"
+                     "可选择 qB 已有标签、新建标签，或从种子移除 / 删除标签定义。"},
+        ]
+        panel = self._tag_panel_for(all_hashes, "")
+        if panel:
+            content.append(panel)
         return {
             "component": "VCard",
             "props": {"class": "pa-2 mb-3"},
-            "content": [
-                {"component": "VCardText", "props": {"class": "text-subtitle-1 pb-1"},
-                 "text": "批量操作（作用于当前可见的全部种子）"},
-                {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": btns},
-                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"},
-                 "text": f"说明：「打标签」给种子加上 {self._operate_tag} 标签（MP 用它标记自己接管的种子），"
-                         f"「去标签」移除该标签；删除类按钮需点两次确认。"},
-            ],
+            "content": content,
         }
 
     # ------------------------------------------------------------------ 行渲染
@@ -814,11 +1053,12 @@ class DownloadManagerEnh(_PluginBase):
                 {"component": "td", "props": {"class": "text-no-wrap"}, "text": f"{r['ratio']:.2f}"},
                 {"component": "td", "props": {"class": "text-no-wrap"}, "text": r["seeding"]},
                 {"component": "td", "props": {"class": "text-caption"}, "text": r["tags"]},
-                {"component": "td", "props": {"style": "min-width:230px"}, "content": [
+                {"component": "td", "props": {"style": "min-width:230px;vertical-align:top"}, "content": [
                     {"component": "div", "props": {
                         "class": "d-flex flex-wrap justify-end",
                         "style": "min-width:230px",
                     }, "content": self._action_buttons(r)},
+                    *[x for x in [self._tag_panel_for([r["hash"]], r["hash"], r)] if x],
                 ]},
             ],
         }
