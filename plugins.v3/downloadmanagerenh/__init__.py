@@ -38,12 +38,36 @@ _OPERATIONS: Dict[str, str] = {
     "recheck": "重新校验",
     "delete": "删除(保留文件)",
     "delete_files": "删除(含文件)",
-    "tag": "加标",
-    "untag": "去标",
+    "tag": "打标签",
+    "untag": "去标签",
 }
 
 # qB 处于「已暂停/已停止」的状态集合：这类种子显示「恢复」按钮，其余显示「暂停」。
 _PAUSED_STATES = {"pausedUP", "pausedDL", "stoppedUP", "stoppedDL"}
+
+# qB 原始状态码 → 中文（统计栏与「状态」列展示用；未收录的原样显示）
+_STATE_CN: Dict[str, str] = {
+    "error": "错误",
+    "missingFiles": "文件缺失",
+    "uploading": "上传中",
+    "pausedUP": "已暂停(做种)",
+    "stoppedUP": "已停止(做种)",
+    "queuedUP": "排队(做种)",
+    "stalledUP": "做种中",
+    "checkingUP": "校验中(做种)",
+    "forcedUP": "强制做种",
+    "allocating": "分配空间",
+    "downloading": "下载中",
+    "metaDL": "获取元数据",
+    "pausedDL": "已暂停(下载)",
+    "stoppedDL": "已停止(下载)",
+    "queuedDL": "排队(下载)",
+    "stalledDL": "下载中(无活动)",
+    "checkingDL": "校验中(下载)",
+    "forcedDL": "强制下载",
+    "moving": "移动中",
+    "unknown": "未知",
+}
 
 # 删除类操作的二次确认有效期（秒）：过期后待确认记录自动失效
 _PENDING_TTL = 180
@@ -54,7 +78,7 @@ class DownloadManagerEnh(_PluginBase):
     plugin_name = "下载管理增强"
     plugin_desc = "补全 qBittorrent 各状态种子的海报与识别信息，并支持对种子执行恢复/暂停/校验/删除/标签等操作。"
     plugin_icon = "downloadmanagerenh.png"
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     plugin_config_prefix = "downloadmanagerenh_"
 
     # ------------------------------------------------------------------ 配置项
@@ -125,8 +149,9 @@ class DownloadManagerEnh(_PluginBase):
                                 "component": "VTextField",
                                 "props": {
                                     "model": "operate_tag",
-                                    "label": "批量打标/去标使用的标签",
-                                    "hint": "「加标/去标」及「全部加标/全部去标」按钮将作用在此标签上",
+                                    "label": "打标签/去标签使用的标签名",
+                                    "hint": "MP 默认用 MOVIEPILOT 标签标记「由 MP 接管的种子」。"
+                                            "「打标签」= 给种子加上该标签，「去标签」= 移除该标签，可改成任意标签名",
                                     "persistent-hint": True,
                                 },
                             }),
@@ -352,6 +377,12 @@ class DownloadManagerEnh(_PluginBase):
 
     # ------------------------------------------------------------------ 格式化
     @staticmethod
+    def _state_cn(state: str) -> str:
+        """qB 状态码转中文；未收录的原样返回。"""
+        key = (state or "").strip()
+        return _STATE_CN.get(key, key or "未知")
+
+    @staticmethod
     def _fmt_size(size: float) -> str:
         if size >= 1e9:
             return f"{size / 1e9:.2f} GB"
@@ -531,7 +562,7 @@ class DownloadManagerEnh(_PluginBase):
         all_hashes = [r["hash"] for r in rows]
         cards = [self._stat_card(str(len(rows)), "合计种子")]
         for st, c in sorted(state_counts.items(), key=lambda x: -x[1]):
-            cards.append(self._stat_card(str(c), st))
+            cards.append(self._stat_card(str(c), self._state_cn(st)))
         total_bytes = sum(float(r.get("size_bytes") or 0) for r in rows)
         cards.append(self._stat_card(self._fmt_size(total_bytes), "占用空间"))
         header = {"component": "VRow", "content": cards}
@@ -682,8 +713,8 @@ class DownloadManagerEnh(_PluginBase):
             btns.append(self._act_btn("删文件", "delete_files", [h], "error"))
         if self._operate_tag:
             tag = self._operate_tag
-            btns.append(self._act_btn("加标", "tag", [h], "primary", tag=tag))
-            btns.append(self._act_btn("去标", "untag", [h], "secondary", tag=tag))
+            btns.append(self._act_btn("打标签", "tag", [h], "primary", tag=tag))
+            btns.append(self._act_btn("去标签", "untag", [h], "secondary", tag=tag))
         return btns
 
     def _batch_toolbar(self, all_hashes: List[str]) -> Optional[dict]:
@@ -702,9 +733,9 @@ class DownloadManagerEnh(_PluginBase):
         ]
         if self._operate_tag:
             tag = self._operate_tag
-            btns.append(self._act_btn(f"全部 +{tag}", "tag", all_hashes, "primary",
+            btns.append(self._act_btn(f"全部打标签(＋{tag})", "tag", all_hashes, "primary",
                                       variant="tonal", tag=tag))
-            btns.append(self._act_btn(f"全部 -{tag}", "untag", all_hashes, "secondary",
+            btns.append(self._act_btn(f"全部去标签(－{tag})", "untag", all_hashes, "secondary",
                                       variant="tonal", tag=tag))
         return {
             "component": "VCard",
@@ -713,6 +744,9 @@ class DownloadManagerEnh(_PluginBase):
                 {"component": "VCardText", "props": {"class": "text-subtitle-1 pb-1"},
                  "text": "批量操作（作用于当前可见的全部种子）"},
                 {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": btns},
+                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"},
+                 "text": f"说明：「打标签」给种子加上 {self._operate_tag} 标签（MP 用它标记自己接管的种子），"
+                         f"「去标签」移除该标签；删除类按钮需点两次确认。"},
             ],
         }
 
@@ -773,7 +807,8 @@ class DownloadManagerEnh(_PluginBase):
                     {"component": "div", "props": {"class": "text-caption " + caption_cls},
                      "text": f"{r['site'] or '—'} · MP管理：{mp_badge}"},
                 ]},
-                {"component": "td", "props": {"class": "text-no-wrap"}, "text": r["state"]},
+                {"component": "td", "props": {"class": "text-no-wrap"},
+                 "text": self._state_cn(r["state"])},
                 {"component": "td", "props": {"class": "text-no-wrap"}, "text": f"{r['progress']:.1f}%"},
                 {"component": "td", "props": {"class": "text-no-wrap"}, "text": r["size"]},
                 {"component": "td", "props": {"class": "text-no-wrap"}, "text": f"{r['ratio']:.2f}"},
@@ -793,7 +828,7 @@ class DownloadManagerEnh(_PluginBase):
             {"component": "div", "props": {"class": "text-subtitle-2 font-weight-bold"},
              "text": r["title"]},
             {"component": "div", "props": {"class": "text-caption"},
-             "text": f"状态：{r['state']}　进度：{r['progress']:.1f}%"},
+             "text": f"状态：{self._state_cn(r['state'])}　进度：{r['progress']:.1f}%"},
             {"component": "div", "props": {"class": "text-caption"},
              "text": f"大小：{r['size']}　分享率：{r['ratio']:.2f}　做种：{r['seeding']}"},
             {"component": "div", "props": {"class": "text-caption"},
