@@ -54,7 +54,7 @@ class DownloadManagerEnh(_PluginBase):
     plugin_name = "下载管理增强"
     plugin_desc = "补全 qBittorrent 各状态种子的海报与识别信息，并支持对种子执行恢复/暂停/校验/删除/标签等操作。"
     plugin_icon = "downloadmanagerenh.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_config_prefix = "downloadmanagerenh_"
 
     # ------------------------------------------------------------------ 配置项
@@ -714,26 +714,43 @@ class DownloadManagerEnh(_PluginBase):
 
     # ------------------------------------------------------------------ 行渲染
     @staticmethod
-    def _poster_img(r: Dict[str, Any]) -> dict:
-        if r["poster"]:
-            return {"component": "img", "props": {
-                "src": r["poster"],
-                "style": "max-height:96px;max-width:100%;border-radius:4px;object-fit:cover;",
-            }}
-        return {"component": "div", "props": {"class": "text-caption"}, "text": "无海报"}
+    def _poster_box(size: int) -> dict:
+        """无海报时的等尺寸占位块，保证列宽稳定不跳动。"""
+        return {
+            "component": "div",
+            "props": {"style": f"width:{size}px;height:{int(size * 1.5)}px;border-radius:4px;"
+                               "background:rgba(255,255,255,.08);"},
+            "text": "",
+        }
 
-    @staticmethod
-    def _poster_td(r: Dict[str, Any]) -> dict:
-        if r["poster"]:
-            return {"component": "td", "content": [
-                {"component": "img", "props": {
-                    "src": r["poster"],
-                    "style": "height:72px;border-radius:4px;object-fit:cover;",
-                }}
-            ]}
-        # 无海报时用短占位，避免「无海报」三字被压成竖排
-        return {"component": "td", "props": {"class": "text-no-wrap text-medium-emphasis"},
-                "text": "—"}
+    @classmethod
+    def _poster_img(cls, r: Dict[str, Any], size: int = 48) -> dict:
+        """
+        用 Vuetify 的 VImg 渲染海报（与 MP 原生下载页一致：固定尺寸 + cover 裁剪 +
+        自带占位/懒加载），避免裸 img 在窄列里被压成细条。
+        """
+        if not r["poster"]:
+            return cls._poster_box(size)
+        return {
+            "component": "VImg",
+            "props": {
+                "src": r["poster"],
+                "width": size,
+                "height": int(size * 1.5),
+                "aspect-ratio": "2/3",
+                "cover": True,
+                "class": "rounded",
+            },
+        }
+
+    @classmethod
+    def _poster_td(cls, r: Dict[str, Any]) -> dict:
+        return {
+            "component": "td",
+            # 固定列宽：防止表格布局把海报列挤扁
+            "props": {"style": "width:60px;min-width:60px"},
+            "content": [cls._poster_img(r, 48)],
+        }
 
     def _row(self, r: Dict[str, Any]) -> dict:
         mp_badge = "是" if r["is_mp"] else "否"
@@ -781,11 +798,11 @@ class DownloadManagerEnh(_PluginBase):
         ]
         # 有海报才占左侧一栏；无海报时内容占满宽度（避免手机上大片留白）
         poster_col = (
-            {"component": "VCol", "props": {"cols": 4, "class": "pa-1"},
-             "content": [self._poster_img(r)]}
+            {"component": "VCol", "props": {"cols": 3, "class": "pa-1"},
+             "content": [self._poster_img(r, 36)]}
             if r["poster"] else None
         )
-        meta_col = {"component": "VCol", "props": {"cols": 8 if poster_col else 12, "class": "pa-1"},
+        meta_col = {"component": "VCol", "props": {"cols": 9 if poster_col else 12, "class": "pa-1"},
                     "content": meta}
         return {
             "component": "VCard",
