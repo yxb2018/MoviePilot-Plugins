@@ -54,7 +54,7 @@ class DownloadManagerEnh(_PluginBase):
     plugin_name = "下载管理增强"
     plugin_desc = "补全 qBittorrent 各状态种子的海报与识别信息，并支持对种子执行恢复/暂停/校验/删除/标签等操作。"
     plugin_icon = "downloadmanagerenh.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_config_prefix = "downloadmanagerenh_"
 
     # ------------------------------------------------------------------ 配置项
@@ -563,10 +563,10 @@ class DownloadManagerEnh(_PluginBase):
             }],
         }
 
-        # 手机卡片：小屏显示（hidden-md-and-up）
+        # 手机卡片：小屏显示（hidden-md-and-up）；底部留白避免被 MP 悬浮助手按钮遮挡
         mobile = {
             "component": "VCol",
-            "props": {"cols": 12, "class": "hidden-md-and-up"},
+            "props": {"cols": 12, "class": "hidden-md-and-up pb-12"},
             "content": [self._row_mobile(r) for r in rows],
         }
 
@@ -731,7 +731,9 @@ class DownloadManagerEnh(_PluginBase):
                     "style": "height:72px;border-radius:4px;object-fit:cover;",
                 }}
             ]}
-        return {"component": "td", "text": "无海报"}
+        # 无海报时用短占位，避免「无海报」三字被压成竖排
+        return {"component": "td", "props": {"class": "text-no-wrap text-medium-emphasis"},
+                "text": "—"}
 
     def _row(self, r: Dict[str, Any]) -> dict:
         mp_badge = "是" if r["is_mp"] else "否"
